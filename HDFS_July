@@ -1,0 +1,299 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+
+
+import os
+import re
+import torch
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from transformers import DistilBertTokenizer, DistilBertForSequenceClassification, Trainer, TrainingArguments
+
+# Set paths
+INPUT_DIR = "DISTIL_FILES/input"
+OUTPUT_DIR = "DISTIL_FILES/output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Load and enhance data with timestamps
+def process_logs():
+    print("Processing logs with timestamps...")
+    
+    # Load data
+    logs_df = pd.read_csv(f"{INPUT_DIR}/preprocessed_logs.csv")
+    traces_df = pd.read_csv(f"{INPUT_DIR}/Event_traces.csv")
+    
+    # Extract timestamps
+    logs_df['Timestamp'] = logs_df['RawLog'].apply(
+        lambda x: re.search(r'(\d{6}\s\d{6})', x).group(1) 
+                 if re.search(r'(\d{6}\s\d{6})', x) else None
+    )
+    
+    # Process event sequences
+    traces_df['EventSequence'] = traces_df['Features'].apply(eval)
+    
+    # Create BlockId to timestamp mapping
+    block_logs = {}
+    for block_id, group in logs_df.groupby('BlockId'):
+        block_logs[block_id] = group.sort_values('Timestamp')[['EventId', 'Timestamp']].values.tolist()
+    
+    # Add time-enhanced sequences
+    traces_df['EventsWithTime'] = traces_df['BlockId'].apply(
+        lambda block_id: block_logs.get(block_id, [])
+    )
+    
+    # Create text features
+    traces_df['TextWithTime'] = traces_df['EventsWithTime'].apply(
+        lambda pairs: " ".join([f"{event}_{time}" for event, time in pairs]) if pairs else ""
+    )
+    
+    # Create baseline text features
+    traces_df['Text'] = traces_df['EventSequence'].apply(lambda x: " ".join(x))
+    
+    # Convert labels
+    traces_df['Label'] = traces_df['Label'].map({"Normal": 0, "Anomaly": 1})
+    
+    # Save enhanced data
+    traces_df.to_csv(f"{OUTPUT_DIR}/enhanced_traces.csv", index=False)
+    
+    return traces_df
+
+# Create dataset class
+class LogDataset(torch.utils.data.Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len=128):
+        self.texts = texts
+        self.labels = labels
+        self.tokenized_inputs = tokenizer(
+            texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt"
+        )
+        
+    def __len__(self):
+        return len(self.labels)
+        
+    def __getitem__(self, idx):
+        item = {key: val[idx] for key, val in self.tokenized_inputs.items()}
+        item['labels'] = torch.tensor(self.labels[idx])
+        return item
+
+# Train and evaluate model
+def train_evaluate_model(train_df, val_df, test_df, text_column, model_name):
+    print(f"Training and evaluating {model_name} model...")
+    
+    # Initialize tokenizer
+    tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+    
+    # Create datasets
+    train_dataset = LogDataset(
+        train_df[text_column].tolist(),
+        train_df['Label'].tolist(),
+        tokenizer
+    )
+    
+    val_dataset = LogDataset(
+        val_df[text_column].tolist(),
+        val_df['Label'].tolist(),
+        tokenizer
+    )
+    
+    test_dataset = LogDataset(
+        test_df[text_column].tolist(),
+        test_df['Label'].tolist(),
+        tokenizer
+    )
+    
+    # Initialize model
+    model = DistilBertForSequenceClassification.from_pretrained(
+        "distilbert-base-uncased", num_labels=2
+    )
+    
+    # Define training arguments
+    training_args = TrainingArguments(
+        output_dir=f"{OUTPUT_DIR}/{model_name}_output",
+        num_train_epochs=3,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=64,
+        warmup_steps=500,
+        weight_decay=0.01,
+        logging_dir=f"{OUTPUT_DIR}/logs",
+        logging_steps=100,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        report_to="none"
+    )
+    
+    # Define metrics computation
+    def compute_metrics(pred):
+        labels = pred.label_ids
+        preds = np.argmax(pred.predictions, axis=1)
+        f1 = f1_score(labels, preds, average='binary')
+        return {
+            'f1': f1,
+        }
+    
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        compute_metrics=compute_metrics
+    )
+    
+    # Train model
+    trainer.train()
+    
+    # Save model
+    model.save_pretrained(f"{OUTPUT_DIR}/{model_name}_model")
+    tokenizer.save_pretrained(f"{OUTPUT_DIR}/{model_name}_tokenizer")
+    
+    # Evaluate on test set
+    predictions = trainer.predict(test_dataset)
+    preds = np.argmax(predictions.predictions, axis=1)
+    labels = test_dataset.labels
+    
+    # Calculate metrics
+    report = classification_report(labels, preds, target_names=["Normal", "Anomaly"], output_dict=True)
+    cm = confusion_matrix(labels, preds)
+    
+    # Save results
+    pd.DataFrame(report).transpose().to_csv(f"{OUTPUT_DIR}/{model_name}_classification_report.csv")
+    np.savetxt(f"{OUTPUT_DIR}/{model_name}_confusion_matrix.txt", cm, fmt='%d')
+    
+    # Print results
+    print(f"\nTest Results for {model_name}:")
+    print(f"F1 Score: {report['macro avg']['f1-score']:.4f}")
+    print(f"Accuracy: {report['accuracy']:.4f}")
+    print("Confusion Matrix:")
+    print(cm)
+    
+    return report, model, tokenizer
+
+# Zero-shot detection
+def zero_shot_detection(model, tokenizer, test_df):
+    print("\nPerforming zero-shot detection...")
+    
+    # Take sample for demonstration
+    sample_df = test_df.sample(min(500, len(test_df)), random_state=42)
+    results = []
+    
+    model.to(device)
+    
+    for _, row in tqdm(sample_df.iterrows(), total=len(sample_df)):
+        events = row['EventSequence']
+        
+        if len(events) <= 1:
+            continue
+        
+        # Use all but the last event to predict if the last event is anomalous
+        context = events[:-1]
+        target = events[-1]
+        
+        # Create input
+        input_text = " ".join(context)
+        
+        # Tokenize
+        inputs = tokenizer(
+            input_text, 
+            padding=True, 
+            truncation=True,
+            max_length=128,
+            return_tensors="pt"
+        ).to(device)
+        
+        # Predict
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=1)
+            pred = torch.argmax(logits, dim=1).item()
+        
+        # Store result
+        results.append({
+            'BlockId': row['BlockId'],
+            'Actual': row['Label'],
+            'Predicted': pred,
+            'Confidence': probs[0][pred].item(),
+            'LastEvent': target
+        })
+    
+    # Create DataFrame
+    results_df = pd.DataFrame(results)
+    
+    # Calculate metrics
+    accuracy = (results_df['Actual'] == results_df['Predicted']).mean()
+    f1 = f1_score(results_df['Actual'], results_df['Predicted'])
+    
+    # Save results
+    results_df.to_csv(f"{OUTPUT_DIR}/zero_shot_results.csv", index=False)
+    
+    print(f"Zero-shot Accuracy: {accuracy:.4f}")
+    print(f"Zero-shot F1 Score: {f1:.4f}")
+    
+    return results_df
+
+# Main function
+def main():
+    print("=== HDFS Log Anomaly Detection ===")
+    
+    # Process logs
+    traces_df = process_logs()
+    
+    # Split data
+    train_df, temp_df = train_test_split(
+        traces_df, test_size=0.3, random_state=42, stratify=traces_df['Label']
+    )
+    val_df, test_df = train_test_split(
+        temp_df, test_size=0.5, random_state=42, stratify=temp_df['Label']
+    )
+    
+    print(f"Training samples: {len(train_df)}")
+    print(f"Validation samples: {len(val_df)}")
+    print(f"Testing samples: {len(test_df)}")
+    
+    # Train baseline model (without timestamps)
+    baseline_results, baseline_model, baseline_tokenizer = train_evaluate_model(
+        train_df, val_df, test_df, 'Text', 'baseline'
+    )
+    
+    # Train enhanced model (with timestamps)
+    enhanced_results, enhanced_model, enhanced_tokenizer = train_evaluate_model(
+        train_df, val_df, test_df, 'TextWithTime', 'enhanced'
+    )
+    
+    # Zero-shot detection
+    zero_shot_df = zero_shot_detection(enhanced_model, enhanced_tokenizer, test_df)
+    
+    # Create comparison
+    comparison = pd.DataFrame({
+        'Model': ['Baseline', 'Enhanced', 'Zero-shot'],
+        'F1 Score': [
+            baseline_results['macro avg']['f1-score'],
+            enhanced_results['macro avg']['f1-score'],
+            f1_score(zero_shot_df['Actual'], zero_shot_df['Predicted'])
+        ],
+        'Accuracy': [
+            baseline_results['accuracy'],
+            enhanced_results['accuracy'],
+            (zero_shot_df['Actual'] == zero_shot_df['Predicted']).mean()
+        ]
+    })
+    
+    # Save comparison
+    comparison.to_csv(f"{OUTPUT_DIR}/model_comparison.csv", index=False)
+    
+    # Print comparison
+    print("\n=== Results Summary ===")
+    print(comparison)
+    print("\nExperiment completed. Results saved to output directory.")
+
+if __name__ == "__main__":
+    main()
